@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#f5f0e7" />
+    <meta name="description" content="家里有个AI，一个一直在家的小伙伴。" />
+    <title>家里有个AI</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="home">
+      <header class="topbar"><span class="home-dot" aria-hidden="true"></span><span>家里有个AI</span><span class="quiet-label">一直在家，偶尔搭话</span></header>
+      <section class="buddy-area" aria-label="AI小伙伴">
+        <div class="buddy" id="buddy" aria-hidden="true">
+          <div class="buddy-ear ear-left"></div><div class="buddy-ear ear-right"></div>
+          <div class="buddy-face"><div class="eyes"><i></i><i></i></div><div class="cheeks"><i></i><i></i></div><div class="smile"></div></div>
+          <div class="buddy-body"><span class="belly"></span></div>
+          <span class="sparkle sparkle-one">✦</span><span class="sparkle sparkle-two">✦</span>
+        </div>
+        <div class="hello">我在家呢<span class="period">。</span></div>
+        <p class="hint" id="hint" aria-live="polite">想说什么，都可以告诉我</p>
+        <span class="state-label" id="stateLabel">安静陪着你</span>
+      </section>
+      <section class="controls" aria-label="和小伙伴说话">
+        <div class="conversation" id="conversation" aria-live="polite" aria-relevant="additions text"></div>
+        <form class="text-form" id="textForm">
+          <label class="sr-only" for="messageInput">和我说说话</label>
+          <input id="messageInput" name="message" maxlength="200" autocomplete="off" placeholder="和我说说话……" />
+          <button class="send-button" type="submit">发送</button>
+        </form>
+        <button class="talk-button" id="talkButton" type="button"><span class="mic" aria-hidden="true">●</span><span id="buttonText">和我说话</span></button>
+        <p class="support-note" id="supportNote">点一下按钮，我会认真听</p>
+      </section>
+      <section class="home-tools" aria-label="设备和测试">
+        <button class="text-button" id="cameraButton" type="button">开启有人感应</button>
+        <button class="text-button" id="simulateButton" type="button">模拟有人出现</button>
+        <span class="camera-note" id="cameraNote">摄像头仅用于本地检测，不会上传或保存视频</span>
+        <video id="cameraVideo" muted playsinline aria-label="本地摄像头预览"></video>
+      </section>
+      <footer>一个陪你在家的小伙伴</footer>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
