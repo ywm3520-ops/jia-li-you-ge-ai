@@ -16,13 +16,22 @@ const video = $('#cameraVideo');
 const states = ['IDLE', 'LISTENING', 'THINKING', 'SPEAKING', 'NOTICE', 'OFFLINE'];
 let currentState = 'IDLE';
 let speechUnlocked = false;
+let speechTaskId = 0;
+let activeSpeech = null;
 let recognition = null;
-let listening = false;
+let recognitionSessionId = 0;
+let recognitionInstanceId = 0;
+let recognitionSessionActive = false;
+let recognitionUserStopped = false;
+let recognitionPhase = 'idle';
+let recognitionRetryTimer = null;
+let recognitionRetryCount = 0;
 let cameraStream = null;
 let cameraTimer = null;
 let previousFrame = null;
 let lastMotionAt = 0;
 let lastGreeting = '';
+let messageTaskId = 0;
 let memory = loadMemory();
 
 function loadMemory() {
@@ -63,17 +72,31 @@ function containsSensitiveInfo(text) {
 }
 
 function detectMemory(text) {
-  const nameMatch = text.match(/(?:我叫|我是|叫我)([\u4e00-\u9fa5A-Za-z0-9]{1,12})(?:呀|啊|哦)?[。！!]?$/);
-  if (nameMatch && !/家里有个AI|人工智能/.test(nameMatch[1])) {
-    memory.name = nameMatch[1]; saveMemory();
-    return `好呀，我记住啦，以后叫你${memory.name}。`;
+  const patterns = [
+    /(?:我喜欢别人叫我|我喜欢你叫我|以后叫我|以后请叫我|以后称呼我|请叫我|请称呼我|称呼我|叫我|我叫|我的名字是)([\u4e00-\u9fa5A-Za-z0-9]{1,12})(?:呀|啊|哦)?[。！!，,？?]?$/
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.trim().match(pattern);
+    if (match && !/家里有个AI|人工智能/.test(match[1])) {
+      const name = match[1];
+      return {
+        reply: `好呀，我记住啦，以后叫你${name}。`,
+        update: { name }
+      };
+    }
   }
+
   const preferenceMatch = text.match(/我喜欢([^，。！？!?,]{1,20})/);
   if (preferenceMatch) {
-    memory.preference = `喜欢${preferenceMatch[1]}`; saveMemory();
-    return `记下来啦，你${memory.preference}。下次聊到它，我可能会想起来。`;
+    const preference = `喜欢${preferenceMatch[1]}`;
+    return {
+      reply: `记下来啦，你${preference}。下次聊到它，我可能会想起来。`,
+      update: { preference }
+    };
   }
-  return '';
+
+  return null;
 }
 
 const choose = (items) => items[Math.floor(Math.random() * items.length)];
@@ -99,49 +122,248 @@ function generateLocalReply(text, context = {}) {
   return choose(['嗯，我听到了。你愿意多说一点吗？', '这个有点意思，我陪你慢慢聊。', '我在呢。今天过得怎么样？', '好呀，我会认真听你说。', '这个我得想一下……你现在心情怎么样？']);
 }
 
-// Replace this boundary with a model adapter in a future version. This build stays fully local.
 async function generateAIReply(text, context) {
-  if (containsSensitiveInfo(text)) return '这类隐私我不会记下来。我们可以聊点别的，我在听。';
+  if (containsSensitiveInfo(text)) return { answer: '这类隐私我不会记下来。我们可以聊点别的，我在听。', memoryUpdate: null };
   const remembered = detectMemory(text);
-  return remembered || generateLocalReply(text, context);
+  if (remembered) return { answer: remembered.reply, memoryUpdate: remembered.update };
+  try {
+    const response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text,
+        context: { memory: { name: context.memory?.name || '', preference: context.memory?.preference || '' } },
+      }),
+      signal: AbortSignal.timeout(22_000),
+    });
+    if (!response.ok) throw new Error('Chat request failed');
+    const data = await response.json();
+    if (typeof data?.reply !== 'string' || !data.reply.trim()) throw new Error('Invalid chat response');
+    return { answer: data.reply.trim(), memoryUpdate: null };
+  } catch {
+    return { answer: generateLocalReply(text, context), memoryUpdate: null };
+  }
+}
+
+function finishSpeech(task, spoken) {
+  if (task.settled) return;
+  task.settled = true;
+  if (task.timeoutId !== null) window.clearTimeout(task.timeoutId);
+  if (activeSpeech === task && speechTaskId === task.id) {
+    activeSpeech = null;
+    if (currentState === 'SPEAKING') setState('IDLE');
+  }
+  task.resolve(spoken);
+}
+
+function stopSpeaking() {
+  const task = activeSpeech;
+  speechTaskId++;
+  activeSpeech = null;
+  if (task && !task.settled) {
+    task.settled = true;
+    if (task.timeoutId !== null) window.clearTimeout(task.timeoutId);
+    task.resolve(false);
+  }
+  try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch { /* Ignore browser cancellation races. */ }
+  if (currentState === 'SPEAKING') setState('IDLE');
 }
 
 function safeSpeak(text, { userInitiated = false } = {}) {
   if (!('speechSynthesis' in window) || typeof window.SpeechSynthesisUtterance !== 'function') return Promise.resolve(false);
   if (!userInitiated && !speechUnlocked) return Promise.resolve(false);
   return new Promise((resolve) => {
+    stopSpeaking();
+    const task = { id: ++speechTaskId, utterance: null, timeoutId: null, resolve, settled: false };
     try {
-      const synth = window.speechSynthesis;
       const utterance = new SpeechSynthesisUtterance(text);
+      task.utterance = utterance;
+      activeSpeech = task;
       utterance.lang = 'zh-CN'; utterance.rate = 0.94;
-      utterance.onstart = () => setState('SPEAKING');
-      utterance.onend = () => { if (currentState === 'SPEAKING') setState('IDLE'); resolve(true); };
-      utterance.onerror = () => { if (currentState === 'SPEAKING') setState('IDLE'); resolve(false); };
-      synth.cancel(); synth.speak(utterance);
-      window.setTimeout(() => { if (currentState === 'SPEAKING') setState('IDLE'); resolve(false); }, 18000);
-    } catch { resolve(false); }
+      utterance.onstart = () => {
+        if (activeSpeech === task && speechTaskId === task.id) setState('SPEAKING');
+      };
+      utterance.onend = () => finishSpeech(task, true);
+      utterance.onerror = () => finishSpeech(task, false);
+      task.timeoutId = window.setTimeout(() => {
+        if (activeSpeech === task && speechTaskId === task.id) stopSpeaking();
+      }, 18000);
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      finishSpeech(task, false);
+    }
   });
+}
+
+function invalidateMessageTasks() {
+  messageTaskId++;
+  return messageTaskId;
+}
+
+function isStopCommand(text) {
+  const normalized = text.normalize('NFKC').toLowerCase().replace(/[\s，。！？、,.!?;；:："“”‘’（）()【】\[\]{}…—\-~～]+/g, '');
+  return new Set(['停', '停止', '停一下', '先停', '先停一下', '别说了', '先别说了', '不要说话', '不要说了', '先不要说话', '先不要说了', '别说话', '别说话了']).has(normalized);
 }
 
 async function processMessage(text, { speak = true } = {}) {
   const clean = text.trim().slice(0, 200);
   if (!clean) return;
+  const taskId = invalidateMessageTasks();
   addBubble('user-bubble', clean);
   hint.textContent = `你说：“${clean}”`;
   setState('THINKING');
-  let answer;
-  try { answer = await generateAIReply(clean, { memory: { ...memory }, recent: memory.recent.slice(-4) }); }
-  catch { answer = '我刚才走了下神，再跟我说一遍好吗？'; }
+  let result;
+  try { result = await generateAIReply(clean, { memory: { ...memory }, recent: memory.recent.slice(-4) }); }
+  catch { result = { answer: '我刚才走了下神，再跟我说一遍好吗？', memoryUpdate: null }; }
+  if (taskId !== messageTaskId) return;
+  const answer = result.answer;
+  if (result.memoryUpdate?.name) memory.name = result.memoryUpdate.name;
+  if (result.memoryUpdate?.preference) memory.preference = result.memoryUpdate.preference;
   addBubble('ai-bubble', answer);
   if (!containsSensitiveInfo(clean)) rememberTurn(clean, answer);
   if (speak) await safeSpeak(answer);
-  if (currentState !== 'LISTENING') setState('IDLE');
+  if (taskId !== messageTaskId) return;
+  if (!activeSpeech && currentState !== 'LISTENING') setState('IDLE');
+}
+
+function clearRecognitionRetry() {
+  if (recognitionRetryTimer !== null) window.clearTimeout(recognitionRetryTimer);
+  recognitionRetryTimer = null;
+}
+
+function recognitionAttemptIsCurrent(sessionId, instanceId, instance) {
+  return sessionId === recognitionSessionId && instanceId === recognitionInstanceId && recognition === instance;
+}
+
+function endRecognitionSession({ userStopped = false } = {}) {
+  recognitionSessionActive = false;
+  recognitionUserStopped = userStopped;
+  recognitionSessionId++;
+  recognitionInstanceId++;
+  clearRecognitionRetry();
+  const previousRecognition = recognition;
+  recognition = null;
+  recognitionPhase = 'idle';
+  buttonText.textContent = '和我说话';
+  if (currentState === 'LISTENING') setState('IDLE');
+  try { previousRecognition?.stop(); } catch { /* Ignore browser shutdown races. */ }
+}
+
+function scheduleRecognitionRetry(Recognition, sessionId) {
+  const delays = [500, 1000, 2000];
+  if (!recognitionSessionActive || recognitionUserStopped || sessionId !== recognitionSessionId || recognitionRetryTimer !== null) return;
+  if (recognitionRetryCount >= delays.length) {
+    recognitionSessionActive = false;
+    recognitionPhase = 'idle';
+    buttonText.textContent = '和我说话';
+    hint.textContent = '语音识别连续中断，请点击按钮重试，也可以使用文字聊天。';
+    if (currentState === 'LISTENING') setState('IDLE');
+    return;
+  }
+  const delay = delays[recognitionRetryCount++];
+  recognitionPhase = 'idle';
+  buttonText.textContent = '正在重新连接……';
+  hint.textContent = '语音识别暂时中断，正在重试……';
+  recognitionRetryTimer = window.setTimeout(() => {
+    recognitionRetryTimer = null;
+    if (!recognitionSessionActive || recognitionUserStopped || sessionId !== recognitionSessionId || recognitionPhase !== 'idle') return;
+    startRecognitionAttempt(Recognition, sessionId);
+  }, delay);
+}
+
+function startRecognitionAttempt(Recognition, sessionId) {
+  if (!recognitionSessionActive || recognitionUserStopped || sessionId !== recognitionSessionId || recognitionPhase !== 'idle') return;
+  const instanceId = ++recognitionInstanceId;
+  let instance = null;
+  let finalResultHandled = false;
+  let terminalError = false;
+  const processedFinalIndexes = new Set();
+  try {
+    instance = new Recognition();
+    recognition = instance;
+    recognitionPhase = 'starting';
+    instance.lang = 'zh-CN'; instance.interimResults = true; instance.maxAlternatives = 1;
+    instance.onstart = () => {
+      if (!recognitionAttemptIsCurrent(sessionId, instanceId, instance)) return;
+      recognitionPhase = 'listening';
+      buttonText.textContent = '我在听……';
+      hint.textContent = '我在听……';
+      if (!activeSpeech) setState('LISTENING');
+    };
+    instance.onresult = (event) => {
+      if (!recognitionAttemptIsCurrent(sessionId, instanceId, instance) || finalResultHandled || terminalError) return;
+      const firstChangedIndex = Number.isInteger(event.resultIndex) ? event.resultIndex : 0;
+      for (let index = firstChangedIndex; index < event.results.length; index++) {
+        const result = event.results[index];
+        const transcript = result?.[0]?.transcript?.trim();
+        if (transcript) hint.textContent = `听到：${transcript}`;
+        if (!result?.isFinal || processedFinalIndexes.has(index)) continue;
+        processedFinalIndexes.add(index);
+        if (!transcript) continue;
+        finalResultHandled = true;
+        recognitionSessionActive = false;
+        clearRecognitionRetry();
+        if (isStopCommand(transcript)) {
+          invalidateMessageTasks();
+          stopSpeaking();
+          hint.textContent = '好，我先不说了。';
+          if (currentState !== 'LISTENING') setState('IDLE');
+          return;
+        }
+        // This one-shot result supersedes any older message/speech, while processMessage
+        // assigns the new task its own latest messageTaskId.
+        invalidateMessageTasks();
+        stopSpeaking();
+        void processMessage(transcript);
+        return;
+      }
+    };
+    instance.onerror = (event) => {
+      if (!recognitionAttemptIsCurrent(sessionId, instanceId, instance)) return;
+      const error = event.error;
+      const permanentErrors = ['not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported'];
+      const permissionError = error === 'not-allowed' || error === 'service-not-allowed';
+      hint.textContent = permissionError
+        ? '需要允许麦克风权限才能听你说话，也可以用文字告诉我。'
+        : '刚才没有听清，再试一次或用文字告诉我吧。';
+      if (permanentErrors.includes(error)) {
+        terminalError = true;
+        recognitionSessionActive = false;
+        clearRecognitionRetry();
+      }
+      if (!activeSpeech) setState('IDLE');
+    };
+    instance.onend = () => {
+      if (!recognitionAttemptIsCurrent(sessionId, instanceId, instance)) return;
+      recognition = null;
+      recognitionPhase = 'idle';
+      buttonText.textContent = '和我说话';
+      if (currentState === 'LISTENING') setState('IDLE');
+      if (finalResultHandled || terminalError || !recognitionSessionActive || recognitionUserStopped) {
+        recognitionSessionActive = false;
+        return;
+      }
+      scheduleRecognitionRetry(Recognition, sessionId);
+    };
+    instance.start();
+  } catch {
+    if (instance && !recognitionAttemptIsCurrent(sessionId, instanceId, instance)) return;
+    recognition = null;
+    recognitionPhase = 'idle';
+    hint.textContent = '麦克风暂时没准备好，可以先用文字和我说话。';
+    if (!activeSpeech) setState('IDLE');
+    scheduleRecognitionRetry(Recognition, sessionId);
+  }
 }
 
 function startListening() {
   speechUnlocked = true;
+  if (recognitionSessionActive || recognitionPhase !== 'idle' || recognitionRetryTimer !== null) {
+    endRecognitionSession({ userStopped: true });
+    return;
+  }
   // Keep the verified first-tap greeting in the user gesture, before requesting the mic.
-  void safeSpeak('你好，我是家里有个AI。', { userInitiated: true });
+  void safeSpeak('你好，我是阿明。', { userInitiated: true });
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!Recognition) {
     hint.textContent = '这个浏览器暂时听不到你的声音，可以先用文字和我说话。';
@@ -149,26 +371,12 @@ function startListening() {
     setState('OFFLINE');
     return;
   }
-  if (listening) { try { recognition?.stop(); } catch { /* Ignore browser shutdown races. */ } return; }
-  try {
-    recognition = new Recognition();
-    recognition.lang = 'zh-CN'; recognition.interimResults = true; recognition.maxAlternatives = 1;
-    recognition.onstart = () => { listening = true; buttonText.textContent = '我在听……'; hint.textContent = '我在听……'; setState('LISTENING'); };
-    recognition.onresult = (event) => {
-      const result = event.results[event.results.length - 1];
-      if (result?.[0]?.transcript) hint.textContent = `听到：${result[0].transcript}`;
-      if (result?.isFinal) { const phrase = result[0].transcript.trim(); listening = false; void processMessage(phrase); }
-    };
-    recognition.onerror = (event) => {
-      listening = false;
-      hint.textContent = event.error === 'not-allowed' || event.error === 'service-not-allowed' ? '需要允许麦克风权限才能听你说话，也可以用文字告诉我。' : '刚才没有听清，再试一次或用文字告诉我吧。';
-      setState('IDLE');
-    };
-    recognition.onend = () => { listening = false; buttonText.textContent = '和我说话'; if (currentState === 'LISTENING') setState('IDLE'); };
-    recognition.start();
-  } catch {
-    listening = false; buttonText.textContent = '和我说话'; hint.textContent = '麦克风暂时没准备好，可以先用文字和我说话。'; setState('IDLE');
-  }
+  recognitionSessionId++;
+  recognitionSessionActive = true;
+  recognitionUserStopped = false;
+  recognitionRetryCount = 0;
+  clearRecognitionRetry();
+  startRecognitionAttempt(Recognition, recognitionSessionId);
 }
 
 function greetingLine() {
@@ -191,7 +399,7 @@ async function noticePresence({ simulated = false } = {}) {
   await new Promise((resolve) => window.setTimeout(resolve, 650));
   if (simulated) await speech;
   else if (speechUnlocked) await safeSpeak(line);
-  if (currentState !== 'SPEAKING') setState('IDLE');
+  if (!activeSpeech && currentState !== 'SPEAKING') setState('IDLE');
 }
 
 function stopCamera() {
@@ -247,7 +455,28 @@ async function startCamera() {
 }
 
 talkButton.addEventListener('click', startListening);
-$('#textForm').addEventListener('submit', (event) => { event.preventDefault(); const text = messageInput.value; messageInput.value = ''; void processMessage(text); });
+
+$('#textForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const text = messageInput.value;
+  messageInput.value = '';
+  if (!text.trim()) return;
+
+  if (isStopCommand(text)) {
+    invalidateMessageTasks();
+    stopSpeaking();
+    endRecognitionSession();
+    hint.textContent = '好，我先不说了。';
+    setState('IDLE');
+    return;
+  }
+
+  invalidateMessageTasks();
+  stopSpeaking();
+  endRecognitionSession();
+  void processMessage(text);
+});
+
 cameraButton.addEventListener('click', () => cameraStream ? stopCamera() : void startCamera());
 $('#simulateButton').addEventListener('click', () => { lastMotionAt = Date.now(); memory.lastGreetingAt = 0; void noticePresence({ simulated: true }); });
 window.addEventListener('pagehide', stopCamera);
